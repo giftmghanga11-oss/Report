@@ -9,7 +9,7 @@ from openpyxl.utils import get_column_letter
 
 
 BASE_DIR = Path(__file__).resolve().parent
-SEQUENCE_FILE = BASE_DIR / "branch_sequence.csv"
+SEQUENCE_FILE = BASE_DIR / "branch_sequence.txt"
 
 # Matches e.g. "MPesa: Ksh1,300.00" or "MPesa: -Ksh1,300.00"
 PAYMENT_PATTERN = re.compile(
