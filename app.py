@@ -275,8 +275,8 @@ def to_excel_bytes(report_df: pd.DataFrame, audit_df: pd.DataFrame, source_name:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Customised Report", layout="wide")
-    st.title("Customised Report")
+    st.set_page_config(page_title="📊 Customised Report", layout="wide")
+    st.title("📊 Customised Report")
 
     base_seq_df = load_sequence_df()
 
