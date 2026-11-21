@@ -275,8 +275,8 @@ def to_excel_bytes(report_df: pd.DataFrame, audit_df: pd.DataFrame, source_name:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Customised Branch Sales Report", layout="wide")
-    st.title("Customised Sales Report by Branch")
+    st.set_page_config(page_title="Customised Report", layout="wide")
+    st.title("Customised Report")
 
     base_seq_df = load_sequence_df()
 
@@ -313,7 +313,7 @@ def main() -> None:
 
     report_df, audit_df, final_seq_df = process_sales(uploaded, active_seq_df)
 
-    st.subheader("Customised Sales Report")
+    st.subheader("Customised Report")
     st.dataframe(
         report_df.style.format("{:,.2f}"),
         use_container_width=True,
@@ -321,13 +321,13 @@ def main() -> None:
 
     excel_data = to_excel_bytes(report_df, audit_df, uploaded.name)
     st.download_button(
-        label="Download Customised Sales Report (.xlsx)",
+        label="Download Customised Report (.xlsx)",
         data=excel_data,
         file_name="Custom_Sales_Report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    with st.expander("Updated Branch Sequence Used"):
+    with st.expander("Branch Sequence Used"):
         st.dataframe(final_seq_df, use_container_width=True, hide_index=True)
 
     with st.expander("Sale-Level Audit Trail"):
