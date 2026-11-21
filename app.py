@@ -29,6 +29,19 @@ REPORT_ROWS = [
     "TOTAL SALES",
 ]
 
+BRANCH_ALIASES = {
+    "KASARAN 2": "KASARANI 2",
+    "KASARANI 2": "KASARANI 2",
+    "ALL SOPS": "ALLSOPS",
+    "ALLSOPS": "ALLSOPS",
+    "BEE CENTRE": "BEE CENTER",
+    "BEE CENTER": "BEE CENTER",
+    "ELD PIONEER": "ELDORET PIONEER",
+    "ELDORET PIONEER": "ELDORET PIONEER",
+    "ELD ROMA": "ELDORET ROMA",
+    "ELDORET ROMA": "ELDORET ROMA",
+}
+
 
 def categorize_payment(raw_method: str) -> str:
     cleaned = re.sub(r"\s+", " ", raw_method.strip().lower())
@@ -50,11 +63,11 @@ def categorize_payment(raw_method: str) -> str:
 
 
 def normalize_branch_key(name: str) -> str:
-    """Normalizes branch names so 'POS JUJA' and 'JUJA' match cleanly."""
+    """Normalizes branch names and common spelling variants for matching."""
     s = re.sub(r"\s+", " ", str(name).strip().upper())
     if s.startswith("POS "):
         s = s[4:].strip()
-    return s
+    return BRANCH_ALIASES.get(s, s)
 
 
 def load_sequence_df() -> pd.DataFrame:
@@ -163,6 +176,8 @@ def process_sales(uploaded_file, seq_df: pd.DataFrame) -> tuple[pd.DataFrame, pd
                     report_df.loc[r_lbl, b_col] = float(raw_pivot.loc[r_lbl, b_col])
 
     report_df.loc["TOTAL SALES"] = report_df.iloc[:-1].sum(axis=0)
+    report_df["TOTAL"] = report_df.sum(axis=1)
+
     return report_df, pd.DataFrame(audit_rows), updated_seq_df
 
 
@@ -216,10 +231,10 @@ def style_report_sheet(ws, report_df: pd.DataFrame, title: str) -> None:
             val = round(float(report_df.loc[row_name, branch]), 2)
             cell = ws.cell(row=r_num, column=c_num, value=val)
             cell.number_format = "#,##0.00;(#,##0.00);0.00"
-            cell.font = total_font if is_total else regular_font
+            cell.font = total_font if (is_total or branch == "TOTAL") else regular_font
             cell.alignment = Alignment(horizontal="right", vertical="center")
             cell.border = total_border if is_total else grid_border
-            if is_total:
+            if is_total or branch == "TOTAL":
                 cell.fill = total_fill
 
     ws.freeze_panes = "B4"
@@ -243,7 +258,8 @@ def to_excel_bytes(report_df: pd.DataFrame, audit_df: pd.DataFrame, source_name:
             f"Sales Report by Branch ({source_name})",
         )
 
-        for branch in report_df.columns:
+        branch_cols = [c for c in report_df.columns if c != "TOTAL"]
+        for branch in branch_cols:
             sheet_title = re.sub(r"[\\/*?:\[\]]", "", str(branch))[:31] or "Branch"
             single_df = report_df[[branch]]
             single_df.to_excel(writer, sheet_name=sheet_title)
