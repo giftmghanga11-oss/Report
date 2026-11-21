@@ -9,7 +9,11 @@ from openpyxl.utils import get_column_letter
 
 
 BASE_DIR = Path(__file__).resolve().parent
-SEQUENCE_FILE = BASE_DIR / "branch_sequence.txt"
+SEQUENCE_FILE = (
+    BASE_DIR / "branch_sequence.txt"
+    if (BASE_DIR / "branch_sequence.txt").exists()
+    else BASE_DIR / "branches.txt"
+)
 
 # Matches e.g. "MPesa: Ksh1,300.00" or "MPesa: -Ksh1,300.00"
 PAYMENT_PATTERN = re.compile(
@@ -70,6 +74,39 @@ def normalize_branch_key(name: str) -> str:
     return BRANCH_ALIASES.get(s, s)
 
 
+def rectify_duplicate_payments(
+    entries: list[tuple[str, float]], invoice_total: float | None
+) -> tuple[list[tuple[str, float]], bool]:
+    """
+    If total parsed payments exceed invoice_total, removes exact duplicate
+    (category, amount) entries (e.g. cashier double-clicking MPesa: Ksh2,900.00
+    on a 2,900 invoice) while preserving legitimate split payments.
+    """
+    if invoice_total is None or pd.isna(invoice_total):
+        return entries, False
+
+    inv_total = float(invoice_total)
+    current_sum = sum(amt for _, amt in entries)
+    if current_sum <= inv_total + 0.05:
+        return entries, False
+
+    cleaned = list(entries)
+    seen: set[tuple[str, float]] = set()
+    deduped: list[tuple[str, float]] = []
+    rectified = False
+
+    for idx, (cat, amt) in enumerate(cleaned):
+        key = (cat, round(amt, 2))
+        remaining_sum = sum(a for _, a in cleaned[idx + 1 :])
+        if key in seen and (sum(a for _, a in deduped) + remaining_sum) >= inv_total - 0.05:
+            rectified = True
+            continue
+        seen.add(key)
+        deduped.append((cat, amt))
+
+    return deduped, rectified
+
+
 def load_sequence_df() -> pd.DataFrame:
     if SEQUENCE_FILE.exists():
         seq_df = pd.read_csv(SEQUENCE_FILE)
@@ -99,7 +136,9 @@ def merge_new_branches(seq_df: pd.DataFrame, observed_branches: list[str]) -> pd
     })
 
 
-def process_sales(uploaded_file, seq_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def process_sales(
+    uploaded_file, seq_df: pd.DataFrame, fix_duplicates: bool = True
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     xls = pd.ExcelFile(uploaded_file)
     df = pd.read_excel(uploaded_file, sheet_name=xls.sheet_names[0])
 
@@ -129,14 +168,23 @@ def process_sales(uploaded_file, seq_df: pd.DataFrame) -> tuple[pd.DataFrame, pd
         branch_col = key_to_display.get(b_key, raw_branch)
 
         pay_text = str(row.get("Payment Type", "") or "")
-        parsed_total = 0.0
-        cat_amounts: dict[str, float] = {}
+        reported_total = row.get("Total.1", row.get("Total", None))
 
+        raw_entries: list[tuple[str, float]] = []
         for method_name, sign, amount_str in PAYMENT_PATTERN.findall(pay_text):
             val = float(amount_str.replace(",", ""))
             if sign == "-":
                 val = -val
-            cat = categorize_payment(method_name)
+            raw_entries.append((categorize_payment(method_name), val))
+
+        if fix_duplicates:
+            cleaned_entries, was_rectified = rectify_duplicate_payments(raw_entries, reported_total)
+        else:
+            cleaned_entries, was_rectified = raw_entries, False
+
+        parsed_total = 0.0
+        cat_amounts: dict[str, float] = {}
+        for cat, val in cleaned_entries:
             cat_amounts[cat] = cat_amounts.get(cat, 0.0) + val
             parsed_total += val
             long_rows.append({"Branch": branch_col, "Category": cat, "Amount": val})
@@ -147,8 +195,9 @@ def process_sales(uploaded_file, seq_df: pd.DataFrame) -> tuple[pd.DataFrame, pd
             "Raw Location": raw_branch,
             "Report Branch": branch_col,
             "Payment Type": pay_text,
-            "Reported Total": row.get("Total.1", row.get("Total", 0.0)),
+            "Reported Total": reported_total if reported_total is not None else 0.0,
             "Parsed Total": round(parsed_total, 2),
+            "Rectified Dup": was_rectified,
         }
         audit_row.update({k: round(v, 2) for k, v in cat_amounts.items()})
         audit_rows.append(audit_row)
@@ -300,18 +349,33 @@ def main() -> None:
             .reset_index(drop=True)
         )
         st.download_button(
-            "Download Updated branch_sequence.csv",
+            "Download Updated branch_sequence.txt",
             data=active_seq_df.to_csv(index=False).encode("utf-8"),
-            file_name="branch_sequence.csv",
+            file_name="branch_sequence.txt",
             mime="text/csv",
         )
+
+    fix_duplicates = st.checkbox(
+        "Auto-rectify duplicate payment entries when payment sum exceeds invoice total (e.g., double-clicked MPesa)",
+        value=True,
+    )
 
     uploaded = st.file_uploader("Upload Detailed Sales Report (.xlsx)", type=["xlsx", "xls"])
     if uploaded is None:
         st.info("Upload your Detailed Sales Report Excel file to generate the customised report.")
         return
 
-    report_df, audit_df, final_seq_df = process_sales(uploaded, active_seq_df)
+    report_df, audit_df, final_seq_df = process_sales(
+        uploaded, active_seq_df, fix_duplicates=fix_duplicates
+    )
+
+    if "Rectified Dup" in audit_df.columns and audit_df["Rectified Dup"].any():
+        rectified_df = audit_df[audit_df["Rectified Dup"]]
+        st.warning(
+            f"Auto-rectified {len(rectified_df)} receipt(s) with duplicate payment entries exceeding invoice total."
+        )
+        with st.expander("View Rectified Duplicate Receipts", expanded=True):
+            st.dataframe(rectified_df, use_container_width=True, hide_index=True)
 
     st.subheader("Customised Report")
     st.dataframe(
