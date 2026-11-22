@@ -74,37 +74,51 @@ def normalize_branch_key(name: str) -> str:
     return BRANCH_ALIASES.get(s, s)
 
 
-def rectify_duplicate_payments(
+def rectify_payments_to_invoice(
     entries: list[tuple[str, float]], invoice_total: float | None
-) -> tuple[list[tuple[str, float]], bool]:
+) -> tuple[list[tuple[str, float]], bool, bool, float]:
     """
-    If total parsed payments exceed invoice_total, removes exact duplicate
-    (category, amount) entries (e.g. cashier double-clicking MPesa: Ksh2,900.00
-    on a 2,900 invoice) while preserving legitimate split payments.
+    1. If parsed payment sum exceeds invoice_total and exact duplicate (category, amount)
+       entries exist, removes duplicates first so the remaining sum does not fall below invoice_total.
+    2. If parsed payment sum still exceeds invoice_total (e.g., payment entered higher than
+       invoice total as in image_9ab4e2.png), scales payments proportionally to match invoice_total
+       and flags the invoice/branch as overpaid.
+    Returns (final_entries, was_rectified_dup, is_overpaid_flagged, excess_amount).
     """
     if invoice_total is None or pd.isna(invoice_total):
-        return entries, False
+        return entries, False, False, 0.0
 
     inv_total = float(invoice_total)
-    current_sum = sum(amt for _, amt in entries)
-    if current_sum <= inv_total + 0.05:
-        return entries, False
+    raw_sum = sum(amt for _, amt in entries)
+    was_rectified_dup = False
 
-    cleaned = list(entries)
-    seen: set[tuple[str, float]] = set()
-    deduped: list[tuple[str, float]] = []
-    rectified = False
+    working = list(entries)
+    if raw_sum > inv_total + 0.05:
+        seen: set[tuple[str, float]] = set()
+        deduped: list[tuple[str, float]] = []
+        for idx, (cat, amt) in enumerate(working):
+            key = (cat, round(amt, 2))
+            remaining_sum = sum(a for _, a in working[idx + 1 :])
+            if key in seen and (sum(a for _, a in deduped) + remaining_sum) >= inv_total - 0.05:
+                was_rectified_dup = True
+                continue
+            seen.add(key)
+            deduped.append((cat, amt))
+        working = deduped
 
-    for idx, (cat, amt) in enumerate(cleaned):
-        key = (cat, round(amt, 2))
-        remaining_sum = sum(a for _, a in cleaned[idx + 1 :])
-        if key in seen and (sum(a for _, a in deduped) + remaining_sum) >= inv_total - 0.05:
-            rectified = True
-            continue
-        seen.add(key)
-        deduped.append((cat, amt))
+    post_dup_sum = sum(amt for _, amt in working)
+    if post_dup_sum > inv_total + 0.05 and abs(post_dup_sum) > 0:
+        excess_amount = round(post_dup_sum - inv_total, 2)
+        ratio = inv_total / post_dup_sum
+        scaled = [(cat, amt * ratio) for cat, amt in working]
+        # Adjust rounding residual on last item so total equals inv_total exactly
+        diff_rem = round(inv_total - sum(a for _, a in scaled), 2)
+        if scaled:
+            last_cat, last_amt = scaled[-1]
+            scaled[-1] = (last_cat, last_amt + diff_rem)
+        return scaled, was_rectified_dup, True, excess_amount
 
-    return deduped, rectified
+    return working, was_rectified_dup, False, 0.0
 
 
 def load_sequence_df() -> pd.DataFrame:
@@ -137,8 +151,11 @@ def merge_new_branches(seq_df: pd.DataFrame, observed_branches: list[str]) -> pd
 
 
 def process_sales(
-    uploaded_file, seq_df: pd.DataFrame, fix_duplicates: bool = True
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    uploaded_file,
+    seq_df: pd.DataFrame,
+    fix_duplicates: bool = True,
+    cap_to_invoice: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     xls = pd.ExcelFile(uploaded_file)
     df = pd.read_excel(uploaded_file, sheet_name=xls.sheet_names[0])
 
@@ -161,6 +178,7 @@ def process_sales(
 
     long_rows = []
     audit_rows = []
+    flagged_rows = []
 
     for _, row in sales_df.iterrows():
         raw_branch = re.sub(r"\s+", " ", str(row.get("Location", "") or "").strip())
@@ -169,6 +187,7 @@ def process_sales(
 
         pay_text = str(row.get("Payment Type", "") or "")
         reported_total = row.get("Total.1", row.get("Total", None))
+        inv_val = float(reported_total) if (reported_total is not None and pd.notna(reported_total)) else None
 
         raw_entries: list[tuple[str, float]] = []
         for method_name, sign, amount_str in PAYMENT_PATTERN.findall(pay_text):
@@ -177,10 +196,34 @@ def process_sales(
                 val = -val
             raw_entries.append((categorize_payment(method_name), val))
 
-        if fix_duplicates:
-            cleaned_entries, was_rectified = rectify_duplicate_payments(raw_entries, reported_total)
+        raw_payment_sum = round(sum(a for _, a in raw_entries), 2)
+        exceeds_invoice = inv_val is not None and raw_payment_sum > inv_val + 0.05
+        raw_excess = round(raw_payment_sum - inv_val, 2) if exceeds_invoice else 0.0
+
+        if exceeds_invoice:
+            flagged_rows.append({
+                "Sale Id": row.get("Sale Id", ""),
+                "Branch (Location)": branch_col,
+                "Raw Location": raw_branch,
+                "Date": row.get("Date", ""),
+                "Invoice Total": round(inv_val, 2),
+                "Payment Total": raw_payment_sum,
+                "Excess Amount": raw_excess,
+                "Payment Type": pay_text,
+            })
+
+        if fix_duplicates or cap_to_invoice:
+            cleaned_entries, was_rectified_dup, was_capped, _ = rectify_payments_to_invoice(
+                raw_entries, inv_val
+            )
+            if not fix_duplicates and was_rectified_dup:
+                cleaned_entries = raw_entries
+                was_rectified_dup = False
+            if not cap_to_invoice and was_capped:
+                cleaned_entries = raw_entries
+                was_capped = False
         else:
-            cleaned_entries, was_rectified = raw_entries, False
+            cleaned_entries, was_rectified_dup, was_capped = raw_entries, False, False
 
         parsed_total = 0.0
         cat_amounts: dict[str, float] = {}
@@ -193,11 +236,15 @@ def process_sales(
             "Sale Id": row.get("Sale Id", ""),
             "Date": row.get("Date", ""),
             "Raw Location": raw_branch,
-            "Report Branch": branch_col,
+            "Branch (Location)": branch_col,
             "Payment Type": pay_text,
-            "Reported Total": reported_total if reported_total is not None else 0.0,
-            "Parsed Total": round(parsed_total, 2),
-            "Rectified Dup": was_rectified,
+            "Invoice Total": round(inv_val, 2) if inv_val is not None else 0.0,
+            "Reported Payment Sum": raw_payment_sum,
+            "Excess Amount": raw_excess,
+            "Reported Sales Total": round(parsed_total, 2),
+            "Flagged Overpayment": exceeds_invoice,
+            "Rectified Dup": was_rectified_dup,
+            "Capped To Invoice": was_capped,
         }
         audit_row.update({k: round(v, 2) for k, v in cat_amounts.items()})
         audit_rows.append(audit_row)
@@ -227,7 +274,7 @@ def process_sales(
     report_df.loc["TOTAL SALES"] = report_df.iloc[:-1].sum(axis=0)
     report_df["TOTAL"] = report_df.sum(axis=1)
 
-    return report_df, pd.DataFrame(audit_rows), updated_seq_df
+    return report_df, pd.DataFrame(audit_rows), updated_seq_df, pd.DataFrame(flagged_rows)
 
 
 def style_report_sheet(ws, report_df: pd.DataFrame, title: str) -> None:
@@ -297,7 +344,12 @@ def style_report_sheet(ws, report_df: pd.DataFrame, title: str) -> None:
         ws.column_dimensions[col_letter].width = min(max_len + 4, 24)
 
 
-def to_excel_bytes(report_df: pd.DataFrame, audit_df: pd.DataFrame, source_name: str) -> bytes:
+def to_excel_bytes(
+    report_df: pd.DataFrame,
+    audit_df: pd.DataFrame,
+    flagged_df: pd.DataFrame,
+    source_name: str,
+) -> bytes:
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         report_df.to_excel(writer, sheet_name="Branch_Sales_Report")
@@ -306,6 +358,9 @@ def to_excel_bytes(report_df: pd.DataFrame, audit_df: pd.DataFrame, source_name:
             report_df,
             f"Sales Report by Branch ({source_name})",
         )
+
+        if not flagged_df.empty:
+            flagged_df.to_excel(writer, sheet_name="Flagged_Overpayments", index=False)
 
         branch_cols = [c for c in report_df.columns if c != "TOTAL"]
         for branch in branch_cols:
@@ -359,23 +414,29 @@ def main() -> None:
         "Auto-rectify duplicate payment entries when payment sum exceeds invoice total (e.g., double-clicked MPesa)",
         value=True,
     )
+    cap_to_invoice = st.checkbox(
+        "Report invoice total amount when payment exceeds invoice total and flag Sale Id + Branch",
+        value=True,
+    )
 
     uploaded = st.file_uploader("Upload Detailed Sales Report (.xlsx)", type=["xlsx", "xls"])
     if uploaded is None:
         st.info("Upload your Detailed Sales Report Excel file to generate the customised report.")
         return
 
-    report_df, audit_df, final_seq_df = process_sales(
-        uploaded, active_seq_df, fix_duplicates=fix_duplicates
+    report_df, audit_df, final_seq_df, flagged_df = process_sales(
+        uploaded,
+        active_seq_df,
+        fix_duplicates=fix_duplicates,
+        cap_to_invoice=cap_to_invoice,
     )
 
-    if "Rectified Dup" in audit_df.columns and audit_df["Rectified Dup"].any():
-        rectified_df = audit_df[audit_df["Rectified Dup"]]
+    if not flagged_df.empty:
         st.warning(
-            f"Auto-rectified {len(rectified_df)} receipt(s) with duplicate payment entries exceeding invoice total."
+            f"Flagged {len(flagged_df)} invoice(s) where payment amount exceeded invoice total."
         )
-        with st.expander("View Rectified Duplicate Receipts", expanded=True):
-            st.dataframe(rectified_df, use_container_width=True, hide_index=True)
+        with st.expander("Flagged Invoices (Payment Exceeds Invoice Total)", expanded=True):
+            st.dataframe(flagged_df, use_container_width=True, hide_index=True)
 
     st.subheader("Customised Report")
     st.dataframe(
@@ -383,7 +444,7 @@ def main() -> None:
         use_container_width=True,
     )
 
-    excel_data = to_excel_bytes(report_df, audit_df, uploaded.name)
+    excel_data = to_excel_bytes(report_df, audit_df, flagged_df, uploaded.name)
     st.download_button(
         label="Download Customised Report (.xlsx)",
         data=excel_data,
