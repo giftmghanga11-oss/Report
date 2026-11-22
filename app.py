@@ -433,9 +433,9 @@ def main() -> None:
 
     if not flagged_df.empty:
         st.warning(
-            f"Flagged {len(flagged_df)} invoice(s) where payment amount exceeded invoice total."
+            f"Flagged {len(flagged_df)} invoice(s)."
         )
-        with st.expander("Flagged Invoices (Payment Exceeds Invoice Total)", expanded=True):
+        with st.expander("Flagged Invoices", expanded=True):
             st.dataframe(flagged_df, use_container_width=True, hide_index=True)
 
     st.subheader("Customised Report")
